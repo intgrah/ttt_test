@@ -42,6 +42,11 @@ rust:
 cpp:
 	g++ -o ttt.cc.exe ttt.cc $(CXXFLAGS)
 
+# Multi-threaded C++ variant. Same output, but not part of `bench`: every
+# other entry here runs single-threaded, so it is not a fair comparison.
+cpp-mt:
+	g++ -o ttt-mt.cc.exe ttt-mt.cc $(CXXFLAGS) -pthread
+
 go:
 	go build -o ttt.go.exe -ldflags="-s -w" ttt.go
 
