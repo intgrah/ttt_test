@@ -13,6 +13,3 @@ ttt
 *.cmo
 *.cmx
 
-# PGO
-.pgo-cc/
-*.gcda

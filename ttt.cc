@@ -24,6 +24,7 @@
  * For more information, please refer to <https://unlicense.org/>
  */
 
+
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -54,15 +55,6 @@ constexpr intptr_t BYTES_E = D_E * intptr_t(sizeof(Cell));
 constexpr intptr_t BYTES_SE = D_SE * intptr_t(sizeof(Cell));
 constexpr intptr_t BYTES_SW = D_SW * intptr_t(sizeof(Cell));
 
-// The four run lengths live in the even bytes of the SWAR word below, so a
-// win is "some 16-bit lane reached WIN_CONDITION". Bias each lane by
-// 0x80 - WIN_CONDITION and test bit 7: run lengths never exceed BOARD_SIZE,
-// so the biased value cannot overflow its byte.
-constexpr uint64_t LANE_LO = 0x00FF00FF00FF00FFULL;
-constexpr uint64_t LANE_ONE = 0x0001000100010001ULL;
-constexpr uint64_t LANE_BIAS = (0x80 - WIN_CONDITION) * LANE_ONE;
-constexpr uint64_t LANE_TEST = 0x0080008000800080ULL;
-
 class Board
 {
     Cell b[BOARD_CELLS];
@@ -75,36 +67,42 @@ public:
 inline bool Board::check_win(int p)
 {
     Cell &q = b[p];
-
-    // One 64-bit read feeds the SWAR win test; the individual runs are read
-    // back as single byte loads (same cache line) to skip 8 shift+mask pairs.
-    uint64_t v;
-    std::memcpy(&v, &q, sizeof(v));
-
-    // lanes: (s,n) (e,w) (se,nw) (ne,sw) -> col, row, diag, anti
-    uint64_t sums = (v & LANE_LO) + ((v >> 8) & LANE_LO) + LANE_ONE;
-
-    if ((sums + LANE_BIAS) & LANE_TEST)
-    {
-        return true;
-    }
-
-    uint8_t col = uint8_t(sums);
-    uint8_t row = uint8_t(sums >> 16);
-    uint8_t diag = uint8_t(sums >> 32);
-    uint8_t anti = uint8_t(sums >> 48);
-
-    // Byte offsets from the played cell to the two run endpoints, in
-    // 64-bit arithmetic so each store folds into one movzx + imul + mov.
     uint8_t *base = (uint8_t *)&q;
-    base[-(intptr_t)q.n * BYTES_S - BYTES_S + 0] = col;
-    base[+(intptr_t)q.s * BYTES_S + BYTES_S + 1] = col;
-    base[-(intptr_t)q.w * BYTES_E - BYTES_E + 2] = row;
-    base[+(intptr_t)q.e * BYTES_E + BYTES_E + 3] = row;
-    base[-(intptr_t)q.nw * BYTES_SE - BYTES_SE + 4] = diag;
-    base[+(intptr_t)q.se * BYTES_SE + BYTES_SE + 5] = diag;
-    base[+(intptr_t)q.sw * BYTES_SW + BYTES_SW + 6] = anti;
-    base[-(intptr_t)q.ne * BYTES_SW - BYTES_SW + 7] = anti;
+
+    // One direction at a time. A winning move ends the game and the board
+    // is cleared before it is used again, so the endpoint writes of the
+    // earlier directions are dead and it does not matter that they have
+    // already happened -- and keeping only one pair of runs live at a time
+    // is what stops the register allocator from spilling. None of the
+    // eight targets can be this cell (every offset is at least one step),
+    // so a store never disturbs a run length still to be read.
+    intptr_t s = q.s, n = q.n;
+    intptr_t col = s + n + 1;
+    if (col >= WIN_CONDITION)
+        return true;
+    base[-n * BYTES_S - BYTES_S + 0] = uint8_t(col);
+    base[+s * BYTES_S + BYTES_S + 1] = uint8_t(col);
+
+    intptr_t e = q.e, w = q.w;
+    intptr_t row = e + w + 1;
+    if (row >= WIN_CONDITION)
+        return true;
+    base[-w * BYTES_E - BYTES_E + 2] = uint8_t(row);
+    base[+e * BYTES_E + BYTES_E + 3] = uint8_t(row);
+
+    intptr_t se = q.se, nw = q.nw;
+    intptr_t diag = se + nw + 1;
+    if (diag >= WIN_CONDITION)
+        return true;
+    base[-nw * BYTES_SE - BYTES_SE + 4] = uint8_t(diag);
+    base[+se * BYTES_SE + BYTES_SE + 5] = uint8_t(diag);
+
+    intptr_t ne = q.ne, sw = q.sw;
+    intptr_t anti = ne + sw + 1;
+    if (anti >= WIN_CONDITION)
+        return true;
+    base[+sw * BYTES_SW + BYTES_SW + 6] = uint8_t(anti);
+    base[-ne * BYTES_SW - BYTES_SW + 7] = uint8_t(anti);
 
     return false;
 }
@@ -116,42 +114,93 @@ enum class Result
     Draw
 };
 
-static uint64_t rng_state = 1729163UL;
-
-Result do_game()
+// Playable positions in scan order, pre-flattened to y * BOARD_PADDED + x.
+struct PosTable
 {
-    // Positions are pre-flattened to y * BOARD_PADDED + x, so the shuffle
-    // touches one array instead of two.
-    uint16_t free_p[BOARD_SIZE_SQUARED];
+    uint16_t v[BOARD_SIZE_SQUARED];
+};
 
-    uint64_t rng = rng_state;
-    for (int y = 1, i = 0; y <= BOARD_SIZE; y++)
-        for (int x = 1, p = y * BOARD_PADDED + 1; x <= BOARD_SIZE; x++, i++, p++)
-        {
-            // Xorshift
-            rng ^= rng << 13;
-            rng ^= rng >> 17;
-            rng ^= rng << 5;
-            rng &= 0xffffffffU;
-            int j = int(rng * uint64_t(i + 1) >> 32);
+constexpr PosTable make_positions()
+{
+    PosTable t = {};
+    int i = 0;
+    for (int y = 1; y <= BOARD_SIZE; y++)
+        for (int x = 1; x <= BOARD_SIZE; x++)
+            t.v[i++] = uint16_t(y * BOARD_PADDED + x);
+    return t;
+}
 
-            free_p[i] = free_p[j];
-            free_p[j] = uint16_t(p);
-        }
-    rng_state = rng;
+constexpr PosTable POS = make_positions();
 
-    static Board circle, cross;
+static uint64_t rng_state = 1729163UL;
+static Board circle, cross;
+
+// How many shuffle steps and moves each pass of the fused loop handles.
+// Two is the sweet spot here: enough independent work to cover the xorshift
+// latency, few enough live values to keep the register allocator honest.
+constexpr int CHUNK = 2;
+static_assert(CHUNK % 2 == 0 && BOARD_SIZE_SQUARED % CHUNK == 0,
+              "CHUNK must be even and divide the board");
+
+// One inside-out Fisher-Yates step. The xorshift keeps a 64-bit state for
+// the first two rounds (the high bits feed the >> 17) but finishes in 32
+// bits, which folds the 0xffffffff mask into the truncation and takes a
+// cycle off the loop-carried dependency. `m` is the 1-based step counter,
+// so the multiplier needs no separate increment.
+#define SHUFFLE_STEP(rng, m, out, pos)                         \
+    do                                                         \
+    {                                                          \
+        uint64_t t_ = (rng) ^ ((rng) << 13);                   \
+        uint32_t u_ = uint32_t(t_) ^ uint32_t(t_ >> 17);       \
+        (rng) = u_ ^ (u_ << 5);                                \
+        int j_ = int((rng) * uint64_t(m) >> 32);               \
+        (out)[(m) -1] = (out)[j_];                             \
+        (out)[j_] = (pos)[(m) -1];                             \
+        (m)++;                                                 \
+    } while (0)
+
+// Plays the permutation in `pos` while building the *next* game's
+// permutation in `out`. The shuffle is a serial xorshift chain and on its
+// own runs latency-bound; interleaving it with the move loop, which is
+// throughput-bound and independent of it, hides almost all of it. The RNG
+// is still consumed in exactly the original order, one whole permutation
+// at a time, so the games are unchanged.
+Result play(const uint16_t *__restrict pos, uint16_t *__restrict out)
+{
     circle.clear();
     cross.clear();
 
-    for (int i = 0; i < BOARD_SIZE_SQUARED; i += 2)
+    const uint16_t *__restrict pt = POS.v;
+    uint64_t rng = rng_state;
+    int m = 1;
+    Result r = Result::Draw;
+
+    for (int k = 0; k < BOARD_SIZE_SQUARED; k += CHUNK)
     {
-        if (circle.check_win(free_p[i]))
-            return Result::Circle;
-        if (cross.check_win(free_p[i + 1]))
-            return Result::Cross;
+        for (int c = 0; c < CHUNK; c++)
+            SHUFFLE_STEP(rng, m, out, pt);
+
+        for (int c = 0; c < CHUNK; c += 2)
+        {
+            if (circle.check_win(pos[k + c]))
+            {
+                r = Result::Circle;
+                goto done;
+            }
+            if (cross.check_win(pos[k + c + 1]))
+            {
+                r = Result::Cross;
+                goto done;
+            }
+        }
     }
-    return Result::Draw;
+done:
+    // A game that ended early still owes the rest of the permutation.
+    while (m <= BOARD_SIZE_SQUARED)
+        SHUFFLE_STEP(rng, m, out, pt);
+
+    rng_state = rng;
+    return r;
 }
 
 int main()
@@ -159,11 +208,22 @@ int main()
     constexpr int n = 10000;
     int o = 0, x = 0, draw = 0;
 
+    static uint16_t perm[2][BOARD_SIZE_SQUARED];
+
     auto start = std::chrono::high_resolution_clock::now();
+
+    // Prime the pipeline with the first game's permutation.
+    {
+        uint64_t rng = rng_state;
+        int m = 1;
+        while (m <= BOARD_SIZE_SQUARED)
+            SHUFFLE_STEP(rng, m, perm[0], POS.v);
+        rng_state = rng;
+    }
 
     for (int i = 0; i < n; i++)
     {
-        switch (do_game())
+        switch (play(perm[i & 1], perm[~i & 1]))
         {
         case Result::Circle:
             o++;
