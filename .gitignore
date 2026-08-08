@@ -7,6 +7,10 @@ ttt
 # C
 *.o
 
+# PGO
+.pgo/
+*.gcda
+
 # OCaml
 *.cmi
 *.cmx

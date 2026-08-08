@@ -1,5 +1,8 @@
 CC := gcc
 CFLAGS := -O3 -Wall -Wextra
+CXX := g++
+CXXFLAGS := -O3 -Wall -Wextra -march=native
+PGODIR := .pgo
 
 all: rust cpp c go ocaml java lean
 
@@ -26,6 +29,8 @@ bench:
 	@python3 ttt.py
 
 clean:
+	rm -rf $(PGODIR)
+	rm -f *.gcda
 	rm -f *.exe
 	rm -f *.o
 	rm -f *.class
@@ -38,8 +43,14 @@ clean:
 rust:
 	rustc -o ttt.rs.exe ttt.rs -C opt-level=3 -C target-cpu=native -C lto
 
+# Profile-guided: build instrumented, run the benchmark itself as the training
+# workload, then rebuild using the collected profile.
 cpp:
-	g++ -o ttt.cc.exe ttt.cc $(CFLAGS)
+	rm -rf $(PGODIR)
+	$(CXX) -o ttt.cc.exe ttt.cc $(CXXFLAGS) -fprofile-generate=$(PGODIR)
+	./ttt.cc.exe > /dev/null
+	$(CXX) -o ttt.cc.exe ttt.cc $(CXXFLAGS) -fprofile-use=$(PGODIR) -fprofile-correction
+	rm -rf $(PGODIR)
 
 go:
 	go build -o ttt.go.exe -ldflags="-s -w" ttt.go
