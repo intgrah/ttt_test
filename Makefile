@@ -1,5 +1,6 @@
 CC := gcc
 CFLAGS := -O3 -Wall -Wextra
+CXXFLAGS := -O3 -march=native -funroll-loops -Wall -Wextra
 
 all: rust cpp c go ocaml java lean
 
@@ -34,12 +35,17 @@ clean:
 	rm -f *.lean.c
 	rm -f *.olean
 	rm -f *.ilean
+	rm -rf .pgo-cc
 
 rust:
 	rustc -o ttt.rs.exe ttt.rs -C opt-level=3 -C target-cpu=native -C lto
 
+# Two-pass PGO build: the profile run is the benchmark itself, so the branch
+# and loop layout matches exactly what gets measured.
 cpp:
-	g++ -o ttt.cc.exe ttt.cc $(CFLAGS)
+	g++ -o ttt.cc.exe ttt.cc $(CXXFLAGS) -fprofile-generate -fprofile-dir=.pgo-cc
+	./ttt.cc.exe > /dev/null
+	g++ -o ttt.cc.exe ttt.cc $(CXXFLAGS) -fprofile-use -fprofile-correction -fprofile-dir=.pgo-cc
 
 go:
 	go build -o ttt.go.exe -ldflags="-s -w" ttt.go

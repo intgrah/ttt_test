@@ -24,45 +24,87 @@
  * For more information, please refer to <https://unlicense.org/>
  */
 
-#include <array>
 #include <chrono>
+#include <cstdint>
+#include <cstring>
 #include <iostream>
 
 constexpr int BOARD_SIZE = 20;
 constexpr int BOARD_PADDED = BOARD_SIZE + 2;
+constexpr int BOARD_CELLS = BOARD_PADDED * BOARD_PADDED;
 constexpr int BOARD_SIZE_SQUARED = BOARD_SIZE * BOARD_SIZE;
 constexpr int WIN_CONDITION = 10;
+
+// Neighbour deltas on the flattened (y * BOARD_PADDED + x) board.
+constexpr int D_S = BOARD_PADDED;
+constexpr int D_E = 1;
+constexpr int D_SE = BOARD_PADDED + 1;
+constexpr int D_SW = BOARD_PADDED - 1;
 
 struct Cell
 {
     uint8_t s, n, e, w, se, nw, ne, sw;
 };
 
+static_assert(sizeof(Cell) == 8, "Cell must pack into a single 64-bit word");
+
+// The same deltas measured in bytes, for direct addressing into the board.
+constexpr intptr_t BYTES_S = D_S * intptr_t(sizeof(Cell));
+constexpr intptr_t BYTES_E = D_E * intptr_t(sizeof(Cell));
+constexpr intptr_t BYTES_SE = D_SE * intptr_t(sizeof(Cell));
+constexpr intptr_t BYTES_SW = D_SW * intptr_t(sizeof(Cell));
+
+// The four run lengths live in the even bytes of the SWAR word below, so a
+// win is "some 16-bit lane reached WIN_CONDITION". Bias each lane by
+// 0x80 - WIN_CONDITION and test bit 7: run lengths never exceed BOARD_SIZE,
+// so the biased value cannot overflow its byte.
+constexpr uint64_t LANE_LO = 0x00FF00FF00FF00FFULL;
+constexpr uint64_t LANE_ONE = 0x0001000100010001ULL;
+constexpr uint64_t LANE_BIAS = (0x80 - WIN_CONDITION) * LANE_ONE;
+constexpr uint64_t LANE_TEST = 0x0080008000800080ULL;
+
 class Board
 {
-    Cell b[BOARD_PADDED][BOARD_PADDED] = {};
+    Cell b[BOARD_CELLS];
 
 public:
-    bool check_win(int x, int y);
+    void clear() { std::memset(b, 0, sizeof(b)); }
+    bool check_win(int p);
 };
 
-bool Board::check_win(int x, int y)
+inline bool Board::check_win(int p)
 {
-    Cell q = b[y][x];
-    uint8_t col = q.s + 1 + q.n;
-    uint8_t row = q.w + 1 + q.e;
-    uint8_t diag = q.nw + 1 + q.se;
-    uint8_t anti = q.ne + 1 + q.sw;
+    Cell &q = b[p];
 
-    if (col >= WIN_CONDITION || row >= WIN_CONDITION || diag >= WIN_CONDITION || anti >= WIN_CONDITION)
+    // One 64-bit read feeds the SWAR win test; the individual runs are read
+    // back as single byte loads (same cache line) to skip 8 shift+mask pairs.
+    uint64_t v;
+    std::memcpy(&v, &q, sizeof(v));
+
+    // lanes: (s,n) (e,w) (se,nw) (ne,sw) -> col, row, diag, anti
+    uint64_t sums = (v & LANE_LO) + ((v >> 8) & LANE_LO) + LANE_ONE;
+
+    if ((sums + LANE_BIAS) & LANE_TEST)
     {
         return true;
     }
 
-    b[y + q.s + 1][x].n = b[y - q.n - 1][x].s = col;
-    b[y][x + q.e + 1].w = b[y][x - q.w - 1].e = row;
-    b[y + q.se + 1][x + q.se + 1].nw = b[y - q.nw - 1][x - q.nw - 1].se = diag;
-    b[y - q.ne - 1][x + q.ne + 1].sw = b[y + q.sw + 1][x - q.sw - 1].ne = anti;
+    uint8_t col = uint8_t(sums);
+    uint8_t row = uint8_t(sums >> 16);
+    uint8_t diag = uint8_t(sums >> 32);
+    uint8_t anti = uint8_t(sums >> 48);
+
+    // Byte offsets from the played cell to the two run endpoints, in
+    // 64-bit arithmetic so each store folds into one movzx + imul + mov.
+    uint8_t *base = (uint8_t *)&q;
+    base[-(intptr_t)q.n * BYTES_S - BYTES_S + 0] = col;
+    base[+(intptr_t)q.s * BYTES_S + BYTES_S + 1] = col;
+    base[-(intptr_t)q.w * BYTES_E - BYTES_E + 2] = row;
+    base[+(intptr_t)q.e * BYTES_E + BYTES_E + 3] = row;
+    base[-(intptr_t)q.nw * BYTES_SE - BYTES_SE + 4] = diag;
+    base[+(intptr_t)q.se * BYTES_SE + BYTES_SE + 5] = diag;
+    base[+(intptr_t)q.sw * BYTES_SW + BYTES_SW + 6] = anti;
+    base[-(intptr_t)q.ne * BYTES_SW - BYTES_SW + 7] = anti;
 
     return false;
 }
@@ -74,49 +116,40 @@ enum class Result
     Draw
 };
 
-uint32_t xorshift(uint32_t max)
-{
-    // Xorshift
-    static uint64_t x = 1729163UL;
-    x ^= x << 13;
-    x ^= x >> 17;
-    x ^= x << 5;
-    x &= 0xffffffffU;
-    return x * uint64_t(max) >> 32;
-}
+static uint64_t rng_state = 1729163UL;
 
 Result do_game()
 {
-    std::array<uint8_t, BOARD_SIZE_SQUARED> free_x;
-    std::array<uint8_t, BOARD_SIZE_SQUARED> free_y;
+    // Positions are pre-flattened to y * BOARD_PADDED + x, so the shuffle
+    // touches one array instead of two.
+    uint16_t free_p[BOARD_SIZE_SQUARED];
 
+    uint64_t rng = rng_state;
     for (int y = 1, i = 0; y <= BOARD_SIZE; y++)
-        for (int x = 1; x <= BOARD_SIZE; x++, i++)
+        for (int x = 1, p = y * BOARD_PADDED + 1; x <= BOARD_SIZE; x++, i++, p++)
         {
-            int j = xorshift(i + 1);
-            free_x[i] = free_x[j];
-            free_y[i] = free_y[j];
-            free_x[j] = x;
-            free_y[j] = y;
+            // Xorshift
+            rng ^= rng << 13;
+            rng ^= rng >> 17;
+            rng ^= rng << 5;
+            rng &= 0xffffffffU;
+            int j = int(rng * uint64_t(i + 1) >> 32);
+
+            free_p[i] = free_p[j];
+            free_p[j] = uint16_t(p);
         }
+    rng_state = rng;
 
-    Board circle, cross;
+    static Board circle, cross;
+    circle.clear();
+    cross.clear();
 
-    for (int i = 0; i < BOARD_SIZE_SQUARED; i++)
+    for (int i = 0; i < BOARD_SIZE_SQUARED; i += 2)
     {
-        int x = free_x[i];
-        int y = free_y[i];
-
-        if (i % 2 == 0)
-        {
-            if (circle.check_win(x, y))
-                return Result::Circle;
-        }
-        else
-        {
-            if (cross.check_win(x, y))
-                return Result::Cross;
-        }
+        if (circle.check_win(free_p[i]))
+            return Result::Circle;
+        if (cross.check_win(free_p[i + 1]))
+            return Result::Cross;
     }
     return Result::Draw;
 }
